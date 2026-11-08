@@ -44,6 +44,7 @@ NAME_VOICE = 256
 
 CHUNK_HEADER = 0
 CHUNK_REPLAY_DATA = 1
+_MISSING = object()
 
 CHEST_GROUPS = {
     "/Game/Building/ActorBlueprints/Containers/Tiered_Chest_Athena.Tiered_Chest_Athena_C": "TieredChest",
@@ -421,7 +422,7 @@ class ChestReplayParser:
         self.groups: dict[str, Group] = {}
         self.by_cleaned: dict[str, Group] = {}
         self.group_by_index: dict[int, Group] = {}
-        self._guid_group: dict[int, Optional[Group]] = {}
+        self._path_group: dict[str, Optional[Group]] = {}
         self.channels: dict[int, Channel] = {}
         self.in_reliable: dict[int, int] = {}
         self.in_packet_id = 0
@@ -639,7 +640,7 @@ class ChestReplayParser:
         self.groups[path] = group
         if group.cleaned:
             self.by_cleaned.setdefault(group.cleaned, group)
-        self._guid_group.clear()
+        self._path_group.clear()
         return group
 
     def _load_object(self, bits: Bits, exporting: bool, depth: int = 0) -> int:
@@ -658,17 +659,17 @@ class ChestReplayParser:
                 bits.u32()
             if exporting:
                 self.guid_to_path[guid] = _remove_path_prefixes(path)
-                self._guid_group.pop(guid, None)
         return guid
 
     def _group_for_guid(self, guid: int) -> Optional[Group]:
-        if guid in self._guid_group:
-            return self._guid_group[guid]
         path = self.guid_to_path.get(guid)
         if path is None:
             return None
+        base = path.split("_UAID_", 1)[0]
+        cached = self._path_group.get(base, _MISSING)
+        if cached is not _MISSING:
+            return cached
         found = None
-        base = path.split("_UAID_")[0]
         for candidate in (path, base, _clean_suffix(base)):
             found = self.by_cleaned.get(candidate)
             if found is not None:
@@ -679,7 +680,7 @@ class ChestReplayParser:
                 size = len(group.cleaned)
                 if size > best and size >= 4 and group.cleaned in path:
                     found, best = group, size
-        self._guid_group[guid] = found
+        self._path_group[base] = found
         return found
 
     def _received_raw_packet(self, data: bytes) -> None:
