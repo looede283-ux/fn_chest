@@ -10,7 +10,7 @@ from typing import Callable, Optional
 
 import oodle_mermaid
 
-PARSER_VERSION = 2
+PARSER_VERSION = 3
 FILE_MAGIC = 0x1CA2E27F
 NETWORK_MAGIC = 0x2CF5A13D
 
@@ -61,7 +61,7 @@ WANTED = {
     "chest": {"bAlreadySearched": "bool", "bDestroyed": "bool", "SearchingPawn": "guid"},
     "gamestate": {"RecorderPlayerState": "guid", "PawnForReplayRelevancy": "guid"},
     "pawn": {"PlayerState": "guid", "On Death Controller": "guid"},
-    "playerstate": {"Owner": "guid"},
+    "playerstate": {"Owner": "guid", "bRespawningFromRespawnData": "bool"},
 }
 
 
@@ -434,6 +434,8 @@ class ChestReplayParser:
         self.pawn_state: dict[int, int] = {}
         self.state_owner: dict[int, int] = {}
         self.view_pawns: set[int] = set()
+        self.relevancy_pawn: Optional[int] = None
+        self.awaiting_respawn_pawn = False
         self.recorder_died = False
         self.chests: dict[int, Chest] = {}
         self.actor_by_channel: dict[int, int] = {}
@@ -975,8 +977,15 @@ class ChestReplayParser:
             if state:
                 self.recorder_state = state
             pawn = values.get("PawnForReplayRelevancy")
-            if pawn and not self.recorder_died:
-                self.view_pawns.add(pawn)
+            if pawn:
+                changed = pawn != self.relevancy_pawn
+                self.relevancy_pawn = pawn
+                if not self.recorder_died:
+                    self.view_pawns.add(pawn)
+                elif self.awaiting_respawn_pawn and changed:
+                    self.view_pawns.add(pawn)
+                    self.awaiting_respawn_pawn = False
+                    self.recorder_died = False
         elif kind == "pawn":
             state = values.get("PlayerState")
             if state:
@@ -984,10 +993,14 @@ class ChestReplayParser:
             dead_controller = values.get("On Death Controller")
             if dead_controller and dead_controller == self.state_owner.get(self.recorder_state):
                 self.recorder_died = True
+                self.view_pawns.add(actor)
         elif kind == "playerstate":
             owner = values.get("Owner")
             if owner:
                 self.state_owner[actor] = owner
+            if (actor == self.recorder_state
+                    and values.get("bRespawningFromRespawnData") is True):
+                self.awaiting_respawn_pawn = True
         elif kind == "chest":
             pawn = values.get("SearchingPawn") or None
             searched = values.get("bAlreadySearched") is True or values.get("bDestroyed") is True
