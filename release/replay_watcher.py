@@ -103,7 +103,7 @@ class ReplayWatcher:
                     busy += 1
                 continue
             guid, live = state
-            if live and age < STABLE_SECONDS:
+            if live:
                 busy += 1
                 continue
             signature = (stat.st_mtime_ns, stat.st_size)
@@ -114,7 +114,7 @@ class ReplayWatcher:
             if self._failed.get(path) == stat.st_size:
                 continue
             known = self.store.get(guid)
-            if known is not None and stat.st_size <= known.size and known.version >= PARSER_VERSION:
+            if known is not None and stat.st_size == known.size and known.version >= PARSER_VERSION:
                 continue
             self._process(path, guid, stat.st_size, known)
         suffix = f" ({busy} still recording)" if busy else ""
@@ -130,6 +130,11 @@ class ReplayWatcher:
             self._failed[path] = size
             self._on_status(f"Could not read {path.name}: {exc}")
             return
+        covered = parser.frame_time * 1000 >= result.duration_ms * 0.9
+        if result.errors and not covered:
+            self._failed[path] = size
+            self._on_status(f"Skipped {path.name}: replay ended early")
+            return
         if not result.recorder_pawns:
             self._failed[path] = size
             self._on_status(f"Skipped {path.name}: could not tell which player recorded it")
@@ -140,5 +145,4 @@ class ReplayWatcher:
                             duration_s=result.duration_ms // 1000, version=PARSER_VERSION)
         self.store.record(entry)
         self._on_entry(entry)
-        gained = entry.added - (known.added if known else 0)
-        self._on_status(f"{path.name}: {gained:+d} chests")
+        self._on_status(f"{path.name}: {entry.chests} chests")

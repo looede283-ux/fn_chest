@@ -10,7 +10,7 @@ from typing import Callable, Optional
 
 import oodle_mermaid
 
-PARSER_VERSION = 3
+PARSER_VERSION = 4
 FILE_MAGIC = 0x1CA2E27F
 NETWORK_MAGIC = 0x2CF5A13D
 
@@ -52,6 +52,8 @@ CHEST_GROUPS = {
     "/Game/Building/ActorBlueprints/Containers/AlwaysSpawn_RareChest.AlwaysSpawn_RareChest_C": "AlwaysSpawnRareChest",
     "/Game/Athena/Items/ForagedItems/BuriedChest/B_Athena_BuriedChest_Chest.B_Athena_BuriedChest_Chest_C": "BuriedChest",
     "/RelicChest/Gameplay/B_TieredChest_Relics.B_TieredChest_Relics_C": "RelicChest",
+    "/SpritePosters/Gameplay/RelicChests/B_Delilah_TieredChest_Relics_Variant1.B_Delilah_TieredChest_Relics_Variant1_C": "DelilahRelicChest",
+    "/SpritePosters/Blueprints/Items/Booty/B_SpritePosters_Booty_Chest.B_SpritePosters_Booty_Chest_C": "SpriteBootyChest",
 }
 GAME_STATE_GROUP = "/Game/Athena/Athena_GameState.Athena_GameState_C"
 PAWN_GROUP = "/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C"
@@ -439,6 +441,7 @@ class ChestReplayParser:
         self.recorder_died = False
         self.chests: dict[int, Chest] = {}
         self.actor_by_channel: dict[int, int] = {}
+        self._held_chests: dict[int, list[tuple]] = {}
 
     def _result(self, name: str) -> ReplayResult:
         pawns = set(self.view_pawns)
@@ -599,6 +602,7 @@ class ChestReplayParser:
             if group is not None and handle is not None:
                 group.exports[handle] = name
                 group.refresh_wanted()
+        self._flush_held_chests()
 
     def _read_field_export_bytes(self, r: ByteReader):
         if not r.u8():
@@ -805,7 +809,9 @@ class ChestReplayParser:
                 group.exports[handle] = name
                 group.refresh_wanted()
             if bits.err:
+                self._flush_held_chests()
                 return
+        self._flush_held_chests()
 
     def _read_field_export_bits(self, bits: Bits):
         if not bits.bit():
@@ -942,7 +948,34 @@ class ChestReplayParser:
         else:
             bits.skip(96)
 
+    def _flush_held_chests(self) -> None:
+        ready = [group for group in self.groups.values()
+                 if group.kind == "chest" and any(name == "bAlreadySearched" for name, _ in group.wanted.values())]
+        for group in ready:
+            pending = self._held_chests.pop(id(group), None)
+            if not pending:
+                continue
+            for actor, index, value, width, pos in pending:
+                if actor is None:
+                    continue
+                previous = self.actor_by_channel.get(index, _MISSING)
+                if actor is not None:
+                    self.actor_by_channel[index] = actor
+                clone = Bits(value, width)
+                clone.pos = pos
+                self._receive_properties(Channel(index), group, clone)
+                if previous is _MISSING:
+                    self.actor_by_channel.pop(index, None)
+                else:
+                    self.actor_by_channel[index] = previous
+
     def _receive_properties(self, channel: Channel, group: Group, bits: Bits) -> None:
+        if (group.kind == "chest" and bits.bits_left() > 0
+                and not any(name == "bAlreadySearched" for name, _ in group.wanted.values())):
+            actor = self.actor_by_channel.get(channel.index)
+            self._held_chests.setdefault(id(group), []).append(
+                (actor, channel.index, bits.v, bits.n, bits.pos))
+            return
         bits.bit()
         values: dict[str, object] = {}
         wanted = group.wanted
