@@ -6,7 +6,7 @@ import tempfile
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 RELEASE = Path(__file__).resolve().parent
 PROJECT = RELEASE.parent
@@ -36,14 +36,14 @@ def parse_github(url: str) -> Optional[tuple[str, str]]:
     return bits[0], bits[1]
 
 
-def apply() -> bool:
+def apply(on_status: Optional[Callable[[str], None]] = None) -> bool:
     try:
-        return _apply()
+        return _apply(on_status)
     except Exception:
         return False
 
 
-def _apply() -> bool:
+def _apply(on_status: Optional[Callable[[str], None]]) -> bool:
     if not SOURCE_FILE.exists():
         return False
     config = json.loads(SOURCE_FILE.read_text(encoding="utf-8"))
@@ -56,21 +56,18 @@ def _apply() -> bool:
     latest = _remote_version(owner, repo, branch)
     if latest is None or version_key(latest) <= version_key(current):
         return False
-    window = _notice(f"Updating Chest Counter to {latest}...")
-    scratch = None
+    if on_status is not None:
+        on_status(f"Updating Chest Counter to {latest}...")
+    downloaded = _download_release(owner, repo, branch)
+    if downloaded is None:
+        return False
+    payload, scratch = downloaded
     try:
-        downloaded = _download_release(owner, repo, branch)
-        if downloaded is None:
-            return False
-        payload, scratch = downloaded
         _replace(payload, RELEASE)
         got = _read_version(VERSION_FILE)
         return version_key(got) >= version_key(latest)
     finally:
-        if scratch is not None:
-            shutil.rmtree(scratch, ignore_errors=True)
-        if window is not None:
-            window.destroy()
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def _read_version(path: Path) -> str:
@@ -146,20 +143,3 @@ def _replace(payload: Path, destination: Path) -> None:
         if path.relative_to(destination) not in incoming:
             path.unlink()
 
-
-def _notice(text: str):
-    import tkinter as tk
-
-    root = tk.Tk()
-    root.title("Chest Counter")
-    root.geometry("360x90")
-    root.resizable(False, False)
-    icon = RELEASE / "icon.ico"
-    if icon.exists():
-        try:
-            root.iconbitmap(icon)
-        except tk.TclError:
-            pass
-    tk.Label(root, text=text, padx=16, pady=24).pack(fill="both", expand=True)
-    root.update()
-    return root

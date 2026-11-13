@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+import bisect
 import ctypes
 import ctypes.wintypes as wt
 import struct
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
 import oodle_mermaid
 
-PARSER_VERSION = 4
+PARSER_VERSION = 5
 FILE_MAGIC = 0x1CA2E27F
 NETWORK_MAGIC = 0x2CF5A13D
 
@@ -58,13 +59,21 @@ CHEST_GROUPS = {
 GAME_STATE_GROUP = "/Game/Athena/Athena_GameState.Athena_GameState_C"
 PAWN_GROUP = "/Game/Athena/PlayerPawn_Athena.PlayerPawn_Athena_C"
 PLAYER_STATE_GROUP = "/Script/FortniteGame.FortPlayerStateAthena"
+TEAM_INFO_GROUP = "/Script/FortniteGame.FortTeamPrivateInfo"
 
 WANTED = {
     "chest": {"bAlreadySearched": "bool", "bDestroyed": "bool", "SearchingPawn": "guid"},
     "gamestate": {"RecorderPlayerState": "guid", "PawnForReplayRelevancy": "guid"},
-    "pawn": {"PlayerState": "guid", "On Death Controller": "guid"},
-    "playerstate": {"Owner": "guid", "bRespawningFromRespawnData": "bool"},
+    "pawn": {"PlayerState": "guid", "On Death Controller": "guid", "ReplicatedMovement": "movement"},
+    "playerstate": {"Owner": "guid", "bRespawningFromRespawnData": "bool", "TeamIndex": "int"},
+    "teaminfo": {"PlayerState": "guid", "LastRepLocation": "vector"},
 }
+# Pawn positions are sampled at most this often (seconds) to keep memory small.
+TRACK_INTERVAL = 0.25
+# A chest opener counts as a teammate when within this distance (world units, 1 m = 100)
+# of a squad mate's shared map location at the same moment.
+SQUAD_RADIUS = 2500
+SQUAD_WINDOW = 3.0
 
 
 class ReplayError(Exception):
@@ -106,6 +115,9 @@ class _AesEcb:
             self._bc.BCryptCloseAlgorithmProvider(self._provider, 0)
 
 
+_U16, _U32, _I32, _U64, _F32 = (struct.Struct(f) for f in ("<H", "<I", "<i", "<Q", "<f"))
+
+
 class ByteReader:
     __slots__ = ("data", "pos")
 
@@ -128,31 +140,47 @@ class ByteReader:
             raise EOFError("skip past end of data")
         self.pos += n
 
+    def _fixed(self, fmt: struct.Struct):
+        pos = self.pos
+        if pos + fmt.size > len(self.data):
+            raise EOFError("read past end of data")
+        self.pos = pos + fmt.size
+        return fmt.unpack_from(self.data, pos)[0]
+
     def u8(self) -> int:
-        return self.read(1)[0]
+        pos = self.pos
+        if pos >= len(self.data):
+            raise EOFError("read past end of data")
+        self.pos = pos + 1
+        return self.data[pos]
 
     def u16(self) -> int:
-        return struct.unpack("<H", self.read(2))[0]
+        return self._fixed(_U16)
 
     def u32(self) -> int:
-        return struct.unpack("<I", self.read(4))[0]
+        return self._fixed(_U32)
 
     def i32(self) -> int:
-        return struct.unpack("<i", self.read(4))[0]
+        return self._fixed(_I32)
 
     def u64(self) -> int:
-        return struct.unpack("<Q", self.read(8))[0]
+        return self._fixed(_U64)
 
     def f32(self) -> float:
-        return struct.unpack("<f", self.read(4))[0]
+        return self._fixed(_F32)
 
     def packed(self) -> int:
+        data, pos, end = self.data, self.pos, len(self.data)
         value = shift = 0
         while True:
-            b = self.u8()
+            if pos >= end:
+                raise EOFError("read past end of data")
+            b = data[pos]
+            pos += 1
             value += (b >> 1) << shift
             shift += 7
             if not b & 1:
+                self.pos = pos
                 return value
 
     def fstring(self) -> str:
@@ -246,12 +274,16 @@ class Bits:
         return value & 0xFFFFFFFF
 
     def serialized_int(self, max_value: int) -> int:
-        value = 0
-        mask = 1
+        value, mask, pos, n, v = 0, 1, self.pos, self.n, self.v
         while value + mask < max_value:
-            if self.bit():
+            if pos >= n:
+                self.err = True
+                break
+            if (v >> pos) & 1:
                 value |= mask
+            pos += 1
             mask <<= 1
+        self.pos = pos
         return value
 
     def fstring(self) -> str:
@@ -274,6 +306,18 @@ class Bits:
     def append(self, other_v: int, other_n: int) -> None:
         self.v |= other_v << self.n
         self.n += other_n
+
+    def quantized_vector(self, scale: int) -> tuple[float, float, float]:
+        # UE5 large-world-coordinate packed vector.
+        info = self.serialized_int(1 << 7)
+        size, scaled = info & 63, info >> 6
+        if size:
+            sign = 1 << (size - 1)
+            parts = [((self.bits(size) ^ sign) - sign) for _ in range(3)]
+            return tuple(p / scale if scaled else float(p) for p in parts)
+        width, fmt = (64, "<d") if scaled else (32, "<f")
+        return tuple(struct.unpack(fmt, self.bits(width).to_bytes(width // 8, "little"))[0]
+                     for _ in range(3))
 
 
 @dataclass
@@ -342,6 +386,8 @@ class ChestEvent:
     kind: str
     pawn: int
     time: float
+    x: Optional[float] = None
+    y: Optional[float] = None
 
 
 @dataclass
@@ -357,6 +403,8 @@ class ReplayResult:
     duration_ms: int
     guid: str = ""
     started: Optional[datetime] = None
+    squad_opened: list[ChestEvent] = field(default_factory=list)
+    squad_size: int = 1
 
     @property
     def count(self) -> int:
@@ -441,7 +489,12 @@ class ChestReplayParser:
         self.recorder_died = False
         self.chests: dict[int, Chest] = {}
         self.actor_by_channel: dict[int, int] = {}
-        self._held_chests: dict[int, list[tuple]] = {}
+        # chest updates that arrived before their group's field exports, replayed once known
+        self._held_chests: dict[Group, list[tuple]] = {}
+        # pawn -> ([times], [(x, y)]) and squad player state -> same, from shared map markers
+        self.tracks: dict[int, tuple[list[float], list[tuple[float, float]]]] = {}
+        self.squad_tracks: dict[int, tuple[list[float], list[tuple[float, float]]]] = {}
+        self.team_of: dict[int, int] = {}
 
     def _result(self, name: str) -> ReplayResult:
         pawns = set(self.view_pawns)
@@ -452,14 +505,39 @@ class ChestReplayParser:
              for a, c in self.chests.items()
              if c.searched and c.opened_by is not None and c.opened_at is not None),
             key=lambda e: e.time)
+        for event in all_opened:
+            spot = _track_at(self.tracks.get(event.pawn), event.time)
+            if spot:
+                event.x, event.y = spot
         mine = [e for e in all_opened if e.pawn in pawns]
+        team = self.team_of.get(self.recorder_state) if self.recorder_state else None
+        mates = {s for s, t in self.team_of.items() if team is not None and t == team}
+        squad_pawns = pawns | self._squad_pawns(all_opened, pawns, mates - {self.recorder_state})
         started = None
         if self.info and self.info.timestamp_ticks:
             started = datetime(1, 1, 1, tzinfo=timezone.utc) + timedelta(
                 microseconds=self.info.timestamp_ticks // 10)
         return ReplayResult(name, self.recorder_state, pawns, mine, all_opened, self.packets,
                             self.bunches, self.errors, self.info.length_ms if self.info else 0,
-                            self.header.guid, started)
+                            self.header.guid, started,
+                            [e for e in all_opened if e.pawn in squad_pawns], max(len(mates), 1))
+
+    def _squad_pawns(self, events: list[ChestEvent], mine: set[int], states: set[int]) -> set[int]:
+        # Pawn ownership is encrypted in replays, so a pawn is matched to a squad mate when it
+        # opens chests where that mate's shared map marker was at the time (majority vote).
+        mates = [self.squad_tracks[s] for s in states if s in self.squad_tracks]
+        votes: dict[int, list[int]] = {}
+        for event in events:
+            if event.pawn in mine or event.x is None:
+                continue
+            near = any(
+                (spot := _track_at(track, event.time, SQUAD_WINDOW)) is not None
+                and (spot[0] - event.x) ** 2 + (spot[1] - event.y) ** 2 <= SQUAD_RADIUS ** 2
+                for track in mates)
+            tally = votes.setdefault(event.pawn, [0, 0])
+            tally[0] += near
+            tally[1] += 1
+        return {pawn for pawn, (hits, total) in votes.items() if hits * 2 > total}
 
     @staticmethod
     def _read_info(r: ByteReader) -> ReplayInfo:
@@ -643,6 +721,8 @@ class ChestReplayParser:
             group.kind = "pawn"
         elif path == PLAYER_STATE_GROUP:
             group.kind = "playerstate"
+        elif path == TEAM_INFO_GROUP:
+            group.kind = "teaminfo"
         self.groups[path] = group
         if group.cleaned:
             self.by_cleaned.setdefault(group.cleaned, group)
@@ -928,12 +1008,38 @@ class ChestReplayParser:
             payload = body.sub(num_bits)
             if body.err:
                 return
-            if rep_object == 0 or payload.at_end() or not has_rep_layout:
+            if rep_object == 0 or payload.at_end():
                 continue
             group = self._group_for_guid(rep_object)
             if group is None or group.kind is None:
                 continue
-            self._receive_properties(channel, group, payload)
+            if has_rep_layout:
+                self._receive_properties(channel, group, payload)
+            elif group.kind == "teaminfo":
+                self._receive_team_info(group, payload)
+
+    def _receive_team_info(self, group: Group, bits: Bits) -> None:
+        # Custom delta (fast array) fields: each element carries a squad mate's map marker.
+        cache = self.groups.get(group.path + "_ClassNetCache")
+        handles = max(len(cache.exports) if cache else 0, 2)
+        while not bits.at_end() and not bits.err:
+            bits.serialized_int(handles)
+            data = bits.sub(bits.packed())
+            if bits.err:
+                return
+            data.skip(64)
+            deletes, changed = data.i32(), data.i32()
+            if not (0 <= deletes < 256 and 0 <= changed < 256):
+                continue
+            data.skip(32 * deletes)
+            for _ in range(changed):
+                data.i32()
+                values = self._read_values(group, data)
+                if data.err:
+                    break
+                state, spot = values.get("PlayerState"), values.get("LastRepLocation")
+                if state and spot:
+                    _track_add(self.squad_tracks.setdefault(state, ([], [])), self.frame_time, spot, 0)
 
     @staticmethod
     def _skip_spawn_vector(bits: Bits, ev: int, quantized_default: bool) -> None:
@@ -949,13 +1055,10 @@ class ChestReplayParser:
             bits.skip(96)
 
     def _flush_held_chests(self) -> None:
-        ready = [group for group in self.groups.values()
-                 if group.kind == "chest" and any(name == "bAlreadySearched" for name, _ in group.wanted.values())]
+        ready = [group for group in self._held_chests
+                 if any(name == "bAlreadySearched" for name, _ in group.wanted.values())]
         for group in ready:
-            pending = self._held_chests.pop(id(group), None)
-            if not pending:
-                continue
-            for actor, index, value, width, pos in pending:
+            for actor, index, value, width, pos in self._held_chests.pop(group):
                 if actor is None:
                     continue
                 previous = self.actor_by_channel.get(index, _MISSING)
@@ -973,9 +1076,15 @@ class ChestReplayParser:
         if (group.kind == "chest" and bits.bits_left() > 0
                 and not any(name == "bAlreadySearched" for name, _ in group.wanted.values())):
             actor = self.actor_by_channel.get(channel.index)
-            self._held_chests.setdefault(id(group), []).append(
+            self._held_chests.setdefault(group, []).append(
                 (actor, channel.index, bits.v, bits.n, bits.pos))
             return
+        values = self._read_values(group, bits)
+        if values:
+            self._on_export(channel, group.kind, values)
+
+    @staticmethod
+    def _read_values(group: Group, bits: Bits) -> dict[str, object]:
         bits.bit()
         values: dict[str, object] = {}
         wanted = group.wanted
@@ -997,9 +1106,18 @@ class ChestReplayParser:
             if bits.err:
                 break
             name, kind = spec
-            values[name] = bool(field_bits.bit()) if kind == "bool" else field_bits.packed()
-        if values:
-            self._on_export(channel, group.kind, values)
+            if kind == "bool":
+                values[name] = bool(field_bits.bit())
+            elif kind == "int":
+                values[name] = field_bits.bits(num_bits)
+            elif kind == "vector":  # FVector_NetQuantize100: integers in hundredths
+                values[name] = tuple(v / 100 for v in field_bits.quantized_vector(1))
+            elif kind == "movement":
+                field_bits.skip(4)  # sleep / physics / server frame / server handle flags
+                values[name] = field_bits.quantized_vector(100)
+            else:
+                values[name] = field_bits.packed()
+        return values
 
     def _on_export(self, channel: Channel, kind: str, values: dict) -> None:
         actor = self.actor_by_channel.get(channel.index)
@@ -1020,6 +1138,9 @@ class ChestReplayParser:
                     self.awaiting_respawn_pawn = False
                     self.recorder_died = False
         elif kind == "pawn":
+            spot = values.get("ReplicatedMovement")
+            if spot:
+                _track_add(self.tracks.setdefault(actor, ([], [])), self.frame_time, spot, TRACK_INTERVAL)
             state = values.get("PlayerState")
             if state:
                 self.pawn_state[actor] = state
@@ -1031,6 +1152,8 @@ class ChestReplayParser:
             owner = values.get("Owner")
             if owner:
                 self.state_owner[actor] = owner
+            if "TeamIndex" in values:
+                self.team_of[actor] = values["TeamIndex"]
             if (actor == self.recorder_state
                     and values.get("bRespawningFromRespawnData") is True):
                 self.awaiting_respawn_pawn = True
@@ -1053,6 +1176,25 @@ class ChestReplayParser:
         guid = channel.archetype if channel.archetype is not None else channel.actor_guid
         group = self._group_for_guid(guid) if guid is not None else None
         return group.path if group else ""
+
+
+def _track_add(track: tuple[list[float], list[tuple[float, float]]], time: float,
+               spot: tuple[float, float, float], interval: float) -> None:
+    times, spots = track
+    if (times and time - times[-1] < interval) or (spot[0] == 0 and spot[1] == 0):
+        return  # throttled, or an unset (origin) position
+    times.append(time)
+    spots.append((spot[0], spot[1]))
+
+
+def _track_at(track: Optional[tuple[list[float], list[tuple[float, float]]]], time: float,
+              window: float = 3.0) -> Optional[tuple[float, float]]:
+    if not track or not track[0]:
+        return None
+    times, spots = track
+    i = bisect.bisect_left(times, time)
+    best = min((j for j in (i - 1, i) if 0 <= j < len(times)), key=lambda j: abs(times[j] - time))
+    return spots[best] if abs(times[best] - time) <= window else None
 
 
 def _hardcoded_name(index: int) -> str:
